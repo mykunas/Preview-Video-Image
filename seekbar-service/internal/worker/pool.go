@@ -1,0 +1,612 @@
+// Package worker implements the concurrent job runner + sprite generator.
+//
+// Lifecycle: the pool starts N goroutines at boot. Each goroutine pulls
+// the next pending job from the store (SQLite or in-memory), runs
+// ffprobe + ffmpeg, persists metadata, and emits a progress event. The
+// pool honours context cancellation so SIGTERM drains gracefully.
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/botnick/telegram-media-downloader/seekbar-service/internal/config"
+	"github.com/botnick/telegram-media-downloader/seekbar-service/internal/ffmpeg"
+	"github.com/botnick/telegram-media-downloader/seekbar-service/internal/logx"
+)
+
+// Job represents a single sprite-generation request.
+type Job struct {
+	ID       string `json:"id"`
+	VideoID  string `json:"video_id"`
+	SrcPath  string `json:"src_path"`
+	Status   string `json:"status"` // pending|running|done|failed|cancelled
+	Error    string `json:"error,omitempty"`
+	Retries  int    `json:"retries"`
+	Priority int    `json:"priority"` // 0 = realtime, 1 = backfill
+	// Source is "path" (a file the sidecar can read) or "upload" (a file
+	// the caller sent in chunks; deleted once the job settles).
+	Source string `json:"source,omitempty"`
+	// Params are per-job overrides of the thumb config (nil = defaults),
+	// so a caller's settings apply without restarting the sidecar.
+	Params *JobParams `json:"params,omitempty"`
+	// Overwrite overrides storage.overwrite for this job ("" = default).
+	// A caller that keeps its own cache sends "always".
+	Overwrite string `json:"overwrite,omitempty"`
+	// Result fields (populated on done)
+	SpritePath  string  `json:"sprite_path,omitempty"`
+	MetaPath    string  `json:"meta_path,omitempty"`
+	Duration    float64 `json:"duration,omitempty"`
+	Frames      int     `json:"frames,omitempty"`
+	Cols        int     `json:"cols,omitempty"`
+	Rows        int     `json:"rows,omitempty"`
+	TileW       int     `json:"tile_w,omitempty"`
+	TileH       int     `json:"tile_h,omitempty"`
+	IntervalSec float64 `json:"interval_sec,omitempty"`
+	Bytes       int64   `json:"bytes,omitempty"`
+	Format      string  `json:"format,omitempty"` // webp | jpg
+	CreatedAt   int64   `json:"created_at"`
+	StartedAt   int64   `json:"started_at,omitempty"`
+	FinishedAt  int64   `json:"finished_at,omitempty"`
+}
+
+// JobParams overrides the service's thumb config for one job. Zero values
+// (and out-of-range ones, see Clamp) fall back to the service defaults.
+type JobParams struct {
+	IntervalSec float64 `json:"interval_sec,omitempty"`
+	TileW       int     `json:"tile_w,omitempty"`
+	Cols        int     `json:"cols,omitempty"`
+	MaxTiles    int     `json:"max_tiles,omitempty"`
+	Format      string  `json:"format,omitempty"`
+	Quality     int     `json:"quality,omitempty"`
+}
+
+// Clamp drops values outside the ranges the service accepts from env, so
+// a bad request can't produce a gigantic sprite. Returns nil when nothing
+// usable is left.
+func (jp *JobParams) Clamp() *JobParams {
+	if jp == nil {
+		return nil
+	}
+	out := *jp
+	if out.IntervalSec != 0 && (out.IntervalSec < 0.5 || out.IntervalSec > 600) {
+		out.IntervalSec = 0
+	}
+	if out.TileW != 0 && (out.TileW < 40 || out.TileW > 800) {
+		out.TileW = 0
+	}
+	if out.Cols != 0 && (out.Cols < 2 || out.Cols > 50) {
+		out.Cols = 0
+	}
+	if out.MaxTiles != 0 && (out.MaxTiles < 4 || out.MaxTiles > 2000) {
+		out.MaxTiles = 0
+	}
+	if out.Quality != 0 && (out.Quality < 1 || out.Quality > 100) {
+		out.Quality = 0
+	}
+	switch out.Format {
+	case "", "webp", "jpeg", "jpg":
+	default:
+		out.Format = ""
+	}
+	if out == (JobParams{}) {
+		return nil
+	}
+	return &out
+}
+
+// thumbFor merges a job's overrides onto the service defaults.
+func thumbFor(base config.ThumbConfig, jp *JobParams) config.ThumbConfig {
+	t := base
+	if jp == nil {
+		return t
+	}
+	if jp.IntervalSec > 0 {
+		t.IntervalSec = jp.IntervalSec
+	}
+	if jp.TileW > 0 {
+		t.Width = jp.TileW
+	}
+	if jp.Cols > 0 {
+		t.Columns = jp.Cols
+	}
+	if jp.MaxTiles > 0 {
+		t.MaxTiles = jp.MaxTiles
+	}
+	if jp.Format != "" {
+		t.Format = jp.Format
+	}
+	if jp.Quality > 0 {
+		t.Quality = jp.Quality
+	}
+	return t
+}
+
+// SpriteMeta is the JSON sidecar written alongside each sprite. The
+// parent system (telegram-media-downloader) reads this via the HTTP
+// /meta/:id endpoint to feed the video player's hover-preview logic.
+type SpriteMeta struct {
+	Version     int     `json:"version"`
+	VideoID     string  `json:"video_id"`
+	SpriteURL   string  `json:"sprite_url,omitempty"`
+	MetaURL     string  `json:"meta_url,omitempty"`
+	DurationSec float64 `json:"duration_sec"`
+	Frames      int     `json:"frames"`
+	Cols        int     `json:"cols"`
+	Rows        int     `json:"rows"`
+	TileW       int     `json:"tile_w"`
+	TileH       int     `json:"tile_h"`
+	IntervalSec float64 `json:"interval_sec"`
+	Format      string  `json:"format"`
+	Bytes       int64   `json:"bytes"`
+	SourceSize  int64   `json:"source_size"`
+	SourceMtime int64   `json:"source_mtime"`
+	GeneratedAt int64   `json:"generated_at"`
+}
+
+// ProgressFunc is called after each completed/failed job so the host
+// process (or SSE/WS relay) can report % completion.
+type ProgressFunc func(done, total, generated, errored, queued int)
+
+// Pool manages concurrent sprite workers.
+type Pool struct {
+	cfg       *config.Config
+	log       *logx.Logger
+	hwArgs    []string
+	hwBackend ffmpeg.HWAccelBackend // resolved at Start() for filter-chain injection
+
+	mu      sync.Mutex
+	queue   []*Job
+	total   int
+	done    int32 // total finished (ok + err)
+	genOk   int32 // completed successfully
+	genErr  int32 // failed permanently
+	running int32 // currently in-flight
+
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	onProgress ProgressFunc
+}
+
+// NewPool creates a ready-to-start pool. Call Start to begin processing.
+func NewPool(cfg *config.Config, log *logx.Logger) *Pool {
+	return &Pool{cfg: cfg, log: log}
+}
+
+// SetProgressCallback wires a function called after each job finishes.
+func (p *Pool) SetProgressCallback(fn ProgressFunc) {
+	p.onProgress = fn
+}
+
+// Submit enqueues a job. Thread-safe.
+//
+// Priority ordering: realtime jobs (Priority == 0) are placed at the front
+// of the queue so they are always processed before backfill jobs
+// (Priority == 1). Within the same priority level, FIFO order is preserved.
+func (p *Pool) Submit(j *Job) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	j.Status = "pending"
+	j.CreatedAt = time.Now().UnixMilli()
+	if j.Priority == 0 {
+		// Realtime: find the first backfill job and insert before it.
+		insertAt := len(p.queue)
+		for i, q := range p.queue {
+			if q.Priority > 0 {
+				insertAt = i
+				break
+			}
+		}
+		p.queue = append(p.queue, nil)
+		copy(p.queue[insertAt+1:], p.queue[insertAt:])
+		p.queue[insertAt] = j
+	} else {
+		// Backfill: append at the back.
+		p.queue = append(p.queue, j)
+	}
+	p.total++
+}
+
+// Snapshot returns a stable job value for polling or JSON encoding. Callers
+// must not read the submitted job pointer while workers are running.
+func (p *Pool) Snapshot(j *Job) Job {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return copyJob(j)
+}
+
+func copyJob(j *Job) Job {
+	out := *j
+	if j.Params != nil {
+		params := *j.Params
+		out.Params = &params
+	}
+	return out
+}
+
+// Cancel only cancels queued jobs; a running ffmpeg operation keeps its current
+// contract. Cancellation and dequeue use the same lock.
+func (p *Pool) Cancel(j *Job) Job {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if j.Status == "pending" {
+		j.Status = "cancelled"
+	}
+	return copyJob(j)
+}
+
+// Start launches worker goroutines. Accepts a pre-resolved hwaccel
+// backend so the caller (server.go) can share detection results with
+// the /health endpoint without probing twice. Pass an empty string to
+// let the pool resolve hwaccel itself from the config.
+//
+// Returns the resolved HWAccelBackend that is now in use (may be "" for
+// CPU-only). Call Stop or cancel the parent ctx to drain.
+func (p *Pool) Start(ctx context.Context, resolvedHWAccel string) ffmpeg.HWAccelBackend {
+	var hwa ffmpeg.HWAccelBackend
+	if resolvedHWAccel != "" {
+		// Caller already probed — trust it.
+		hwa = ffmpeg.HWAccelBackend(resolvedHWAccel)
+	} else {
+		// Resolve hwaccel once at boot rather than per-job.
+		probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Second)
+		var err error
+		hwa, err = ffmpeg.Resolve(probeCtx, p.cfg.FFmpeg.Path, p.cfg.FFmpeg.HWAccel, p.cfg.FFmpeg.VAAPIDevice)
+		probeCancel()
+		if err != nil {
+			p.log.Warn("hwaccel resolve failed, using CPU", "err", err)
+		}
+	}
+	p.hwArgs = ffmpeg.Args(hwa, p.cfg.FFmpeg.VAAPIDevice)
+	p.hwBackend = hwa
+	if len(p.hwArgs) > 0 {
+		p.log.Info("hwaccel active", "backend", string(hwa))
+	} else {
+		p.log.Info("hwaccel not available, using CPU decode")
+	}
+
+	ctx, p.cancel = context.WithCancel(ctx)
+	n := p.cfg.Jobs.Concurrency
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		p.wg.Add(1)
+		go p.worker(ctx)
+	}
+	return hwa
+}
+
+// Stop signals cancellation and waits for in-flight jobs to finish.
+func (p *Pool) Stop() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.wg.Wait()
+}
+
+// Stats returns a snapshot of pool counters.
+// Returns: queued, processing, completed, failed counts.
+func (p *Pool) Stats() (queued, processing, completed, failed int) {
+	p.mu.Lock()
+	queued = len(p.queue)
+	p.mu.Unlock()
+	return queued,
+		int(atomic.LoadInt32(&p.running)),
+		int(atomic.LoadInt32(&p.genOk)),
+		int(atomic.LoadInt32(&p.genErr))
+}
+
+// LegacyStats returns the old (total, done, genOk, genErr, queued)
+// tuple for backwards-compatible callers.
+func (p *Pool) LegacyStats() (total, done, genOk, genErr, queued int) {
+	p.mu.Lock()
+	queued = len(p.queue)
+	total = p.total
+	p.mu.Unlock()
+	return total, int(atomic.LoadInt32(&p.done)), int(atomic.LoadInt32(&p.genOk)),
+		int(atomic.LoadInt32(&p.genErr)), queued
+}
+
+// next dequeues the next job, including jobs that were externally
+// cancelled (the caller handles the cancelled case).
+func (p *Pool) next() *Job {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.queue) == 0 {
+		return nil
+	}
+	j := p.queue[0]
+	p.queue = p.queue[1:]
+	if j.Status != "cancelled" {
+		j.Status = "running"
+		j.StartedAt = time.Now().UnixMilli()
+	} else {
+		j.FinishedAt = time.Now().UnixMilli()
+	}
+	return j
+}
+
+func (p *Pool) worker(ctx context.Context) {
+	defer p.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		j := p.next()
+		if j == nil {
+			// Back-off when the queue is empty.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+				continue
+			}
+		}
+		// Work on a private copy; publish all result fields together after
+		// cleanup. Readers must never see a partially completed result.
+		queued := j
+		working := p.Snapshot(queued)
+		j = &working
+		// Job was cancelled via the HTTP cancel endpoint before it was
+		// picked up — count it as done but don't invoke ffmpeg.
+		if j.Status == "cancelled" {
+			p.cleanupUpload(j)
+			d := int(atomic.AddInt32(&p.done, 1))
+			if p.onProgress != nil {
+				p.mu.Lock()
+				q, total := len(p.queue), p.total
+				p.mu.Unlock()
+				p.onProgress(d, total, int(atomic.LoadInt32(&p.genOk)), int(atomic.LoadInt32(&p.genErr)), q)
+			}
+			continue
+		}
+		atomic.AddInt32(&p.running, 1)
+		p.processJob(ctx, j)
+		p.cleanupUpload(j)
+		p.mu.Lock()
+		*queued = working
+		p.mu.Unlock()
+		atomic.AddInt32(&p.running, -1)
+		d := int(atomic.AddInt32(&p.done, 1))
+		if p.onProgress != nil {
+			p.mu.Lock()
+			q, total := len(p.queue), p.total
+			p.mu.Unlock()
+			p.onProgress(d, total, int(atomic.LoadInt32(&p.genOk)), int(atomic.LoadInt32(&p.genErr)), q)
+		}
+	}
+}
+
+// cleanupUpload removes an uploaded source once its job has settled.
+func (p *Pool) cleanupUpload(j *Job) {
+	if j.Source == "upload" && j.SrcPath != "" {
+		if err := os.Remove(j.SrcPath); err != nil && !os.IsNotExist(err) {
+			p.log.Warn("upload cleanup failed", "video_id", j.VideoID, "err", err)
+		}
+	}
+}
+
+func (p *Pool) processJob(ctx context.Context, j *Job) {
+	cfg := p.cfg
+	outDir := cfg.Storage.OutputDir
+	thumb := thumbFor(cfg.Thumb, j.Params)
+
+	ext := "webp"
+	if thumb.Format == "jpeg" || thumb.Format == "jpg" {
+		ext = "jpg"
+	}
+	j.Format = ext
+	dstPath := filepath.Join(outDir, j.VideoID+"."+ext)
+	metaPath := filepath.Join(outDir, j.VideoID+".json")
+	// An uploaded source is a fresh temp file every time: the caller
+	// already decided the sprite is stale, so skip the cache shortcuts.
+	policy := cfg.Storage.Overwrite
+	switch j.Overwrite {
+	case "never", "if-changed", "always":
+		policy = j.Overwrite
+	}
+	if j.Source == "upload" {
+		policy = "always"
+	}
+
+	// Overwrite policy check.
+	if policy == "never" {
+		if fileExists(dstPath) && fileExists(metaPath) {
+			j.Status = "done"
+			j.SpritePath = dstPath
+			j.MetaPath = metaPath
+			j.FinishedAt = time.Now().UnixMilli()
+			atomic.AddInt32(&p.genOk, 1)
+			return
+		}
+	}
+
+	// Duration probe.
+	dur, err := ffmpeg.Duration(ctx, cfg.FFmpeg.ProbePath, j.SrcPath)
+	if err != nil {
+		p.fail(j, fmt.Sprintf("probe: %v", err))
+		return
+	}
+	j.Duration = dur
+
+	plan := ffmpeg.Plan(dur, thumb.IntervalSec, thumb.Columns, thumb.MaxTiles, thumb.Width)
+
+	// if-changed: compare source size/mtime with prior meta.
+	// The sprite itself must still be there — a meta file alone (sprite
+	// deleted, or meta written by the parent app) is not a cache hit.
+	if policy == "if-changed" && fileExists(metaPath) && fileExists(dstPath) {
+		if prior, ok := readMeta(metaPath); ok {
+			si, _ := os.Stat(j.SrcPath)
+			if si != nil && prior.SourceSize == si.Size() && prior.SourceMtime == si.ModTime().UnixMilli() {
+				j.Status = "done"
+				j.SpritePath = dstPath
+				j.MetaPath = metaPath
+				j.Duration = prior.DurationSec
+				j.Frames = prior.Frames
+				j.Cols = prior.Cols
+				j.Rows = prior.Rows
+				j.TileW = prior.TileW
+				j.TileH = prior.TileH
+				j.IntervalSec = prior.IntervalSec
+				j.Bytes = prior.Bytes
+				j.FinishedAt = time.Now().UnixMilli()
+				atomic.AddInt32(&p.genOk, 1)
+				return
+			}
+		}
+	}
+
+	// Build sprite. Cap ffmpeg threads per job so concurrent workers don't
+	// oversubscribe the CPU (e.g. 2 workers × 8 threads = 16 on an 8-core
+	// box). Floor at 2 threads for decode + scale pipeline efficiency.
+	threadsPerJob := runtime.NumCPU() / max(1, cfg.Jobs.Concurrency)
+	if threadsPerJob < 2 {
+		threadsPerJob = 2
+	}
+	tmpPath := ffmpeg.TempPath(dstPath)
+	args := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, thumb.Format, thumb.Quality, p.hwArgs, cfg.FFmpeg.ExtraArgs, p.hwBackend, threadsPerJob)
+	cpuArgs := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, thumb.Format, thumb.Quality, nil, cfg.FFmpeg.ExtraArgs, "", threadsPerJob)
+
+	var lastErr error
+	maxAttempts := cfg.Jobs.MaxRetries + 1
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if ctx.Err() != nil {
+			j.Status = "cancelled"
+			j.FinishedAt = time.Now().UnixMilli()
+			return
+		}
+		useArgs := args
+		if attempt > 0 && len(p.hwArgs) > 0 {
+			useArgs = cpuArgs
+		}
+		if err := ffmpeg.Run(ctx, cfg.FFmpeg.Path, useArgs); err != nil {
+			lastErr = err
+			delay := time.Duration(attempt+1) * time.Second
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				_ = os.Remove(tmpPath)
+				j.Status = "cancelled"
+				j.FinishedAt = time.Now().UnixMilli()
+				return
+			case <-time.After(delay):
+			}
+			continue
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		_ = os.Remove(tmpPath)
+		p.fail(j, fmt.Sprintf("ffmpeg: %v", lastErr))
+		return
+	}
+	if err := ffmpeg.AtomicRename(tmpPath, dstPath); err != nil {
+		p.fail(j, fmt.Sprintf("rename: %v", err))
+		return
+	}
+
+	// Probe actual sprite dimensions to derive tile_h.
+	// tile_h cannot be computed from the plan alone because ffmpeg may
+	// round the height differently (e.g. -2 snaps to nearest even number).
+	tileH := 0
+	if imgW, imgH, dimErr := ffmpeg.ReadImageDims(dstPath); dimErr == nil {
+		_ = imgW // tile width is already known from the plan
+		if plan.Rows > 0 {
+			tileH = imgH / plan.Rows
+		}
+	} else {
+		p.log.Warn("sprite dim probe failed, tile_h=0", "video_id", j.VideoID, "err", dimErr)
+	}
+
+	// Write JSON meta.
+	fi, _ := os.Stat(dstPath)
+	var spriteBytes int64
+	if fi != nil {
+		spriteBytes = fi.Size()
+	}
+	si, _ := os.Stat(j.SrcPath)
+	var srcSize int64
+	var srcMtime int64
+	if si != nil {
+		srcSize = si.Size()
+		srcMtime = si.ModTime().UnixMilli()
+	}
+	meta := SpriteMeta{
+		Version:     1,
+		VideoID:     j.VideoID,
+		SpriteURL:   cfg.HTTP.BasePath + "/sprite/" + j.VideoID,
+		MetaURL:     cfg.HTTP.BasePath + "/meta/" + j.VideoID,
+		DurationSec: dur,
+		Frames:      plan.Frames,
+		Cols:        plan.Cols,
+		Rows:        plan.Rows,
+		TileW:       plan.TileW,
+		TileH:       tileH,
+		IntervalSec: plan.IntervalSec,
+		Format:      ext,
+		Bytes:       spriteBytes,
+		SourceSize:  srcSize,
+		SourceMtime: srcMtime,
+		GeneratedAt: time.Now().UnixMilli(),
+	}
+	raw, _ := json.Marshal(meta)
+	tmpMeta := ffmpeg.TempPath(metaPath)
+	if err := os.WriteFile(tmpMeta, raw, 0o644); err == nil {
+		_ = ffmpeg.AtomicRename(tmpMeta, metaPath)
+	} else {
+		_ = os.Remove(tmpMeta)
+	}
+
+	j.Status = "done"
+	j.SpritePath = dstPath
+	j.MetaPath = metaPath
+	j.Frames = plan.Frames
+	j.Cols = plan.Cols
+	j.Rows = plan.Rows
+	j.TileW = plan.TileW
+	j.TileH = tileH
+	j.IntervalSec = plan.IntervalSec
+	j.Bytes = spriteBytes
+	j.FinishedAt = time.Now().UnixMilli()
+	atomic.AddInt32(&p.genOk, 1)
+	p.log.Debug("sprite done", "video_id", j.VideoID, "frames", plan.Frames, "tile_h", tileH, "bytes", spriteBytes)
+}
+
+func (p *Pool) fail(j *Job, msg string) {
+	j.Status = "failed"
+	j.Error = msg
+	j.FinishedAt = time.Now().UnixMilli()
+	j.Retries++
+	atomic.AddInt32(&p.genErr, 1)
+	p.log.Warn("job failed", "video_id", j.VideoID, "err", msg)
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func readMeta(p string) (SpriteMeta, bool) {
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return SpriteMeta{}, false
+	}
+	var m SpriteMeta
+	if json.Unmarshal(raw, &m) != nil {
+		return SpriteMeta{}, false
+	}
+	return m, true
+}

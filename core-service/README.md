@@ -1,0 +1,167 @@
+# tgdl-server (Go)
+
+`cmd/tgdl-server` is the Telegram Media Downloader application: one Go binary
+that serves the embedded dashboard (`internal/webassets/public`), the HTTP API,
+media and WebSocket connections, and owns SQLite and the Telegram (gotd)
+accounts. It never starts or proxies to a Node.js server. ffmpeg is the only
+external program it calls (thumbnails and MP4 faststart).
+
+User documentation: [install and deploy](../docs/DEPLOY.md),
+[configuration](../docs/CONFIGURATION.md) and [features](../docs/FEATURES.md).
+`cmd/tgdl-core` and the `api`, `front`, `dbscan` and `seekbar` packages belong
+to the 2.x companion binary; they are not built for 3.x releases.
+
+## Run
+
+```sh
+TGDL_DATA_DIR=/var/lib/telegram-media-downloader PORT=3000 \
+  ./tgdl-server
+```
+
+`TGDL_DATA_DIR` is required. The server creates `db.sqlite` and applies the
+same idempotent schema used by existing installations. `PORT` defaults to
+`3000`; `TGDL_SESSION_TTL_DAYS` defaults to 7. The existing session cookie
+name is preserved as `tg_dl_session`.
+
+Commands:
+
+```sh
+./tgdl-server version
+./tgdl-server help
+./tgdl-server setup --password-stdin < password-file   # first dashboard password, via the running server
+./tgdl-server backup-restore --help                     # offline snapshot restore
+./tgdl-server backup-decrypt --help                     # decrypt a TGDB archive
+```
+
+## HTTP and WebSocket surface
+
+- `GET /health` reports readiness without authentication.
+- `POST /api/auth/setup`, `POST /api/login`, `POST /api/logout`, and
+  `GET /api/auth_check` manage the compatible scrypt/session flow.
+- `GET /` and asset paths serve the embedded SPA.
+- `GET /` or `GET /ws` upgrades an authenticated session; events
+  are bounded and role-filtered so a slow browser cannot block workers.
+  Revocation, expiry and shutdown close the owned connection; password changes
+  invalidate old admin sessions. See [session lifetime and compatibility](../docs/GO-WEBSOCKET-SESSIONS.md).
+- Native periodic status/statistics pushes and rescue retention use owned,
+  bounded workers. Source-delete receipts survive queued transfers and restart;
+  expiry retains pinned and shared-file owners. See
+  [rescue behavior, events and limitations](../docs/GO-RESCUE.md).
+- `/v1/db/*` exposes the read projections used by the gallery, maintenance,
+  AI, NSFW, integrity, dedup and cluster surfaces. They run directly against
+  a query-only pool, require an admin session and are not a public API.
+- Pin mutations, job status/cancellation and SQLite backup
+  are owned by Go and commit before broadcasting their event.
+- Cluster pairing, durable request replay checks, automatic paged catalog pulls
+  and ranged peer-file proxying run in Go. Signed peer sockets wake durable
+  add/edit/delete reconciliation, including disconnect recovery and native restore
+  epoch changes. Discovery and failover are not implemented. See [cluster mode](../docs/CLUSTER.md) and [cluster internals](../docs/GO-CLUSTER.md).
+- `/api/history` runs native durable backfills using the shared account/queue
+  engine, including jobs-only operation, cancellation and restart resumption.
+  See [history limits, semantics and validation](../docs/GO-HISTORY.md).
+- `/api/download/url` reads fresh Telegram messages through the same account
+  pool and persists explicit URL work before acknowledgement, including when
+  live monitoring is off. See [link behavior and validation](../docs/GO-URL-DOWNLOADS.md).
+- Dialog resync and group refresh read current Telegram names and avatars through
+  the shared accounts. Maintenance restart joins old transfers before opening new
+  accounts. See [behavior, limits and measurements](../docs/GO-MONITOR-MAINTENANCE.md).
+- Stories listing and selected downloads use the same native accounts and durable
+  dedup queue, with distinct story/message keys. The proxy test performs a bounded
+  TCP probe. See [story behavior and compatibility](../docs/GO-STORIES.md).
+- Configured SOCKS4/5 and MTProxy connections now cover accounts, login and media
+  DCs. Handshakes are bounded and invalid settings cannot silently select direct
+  connections. See [proxy configuration and verification](../docs/GO-PROXIES.md).
+
+- Native local, S3, SFTP and FTP/FTPS mirror/snapshot backups cover durable enqueue,
+  destination controls, retry/pause, cron and retention. S3 uses bounded multipart
+  uploads and checksums; SFTP persists host keys and publishes complete files.
+  Shared upload pacing respects network deadlines, and a durable journal cleans
+  owned multipart uploads/temporary files after process death or destination
+  edits/deletion. FTP verifies uploaded content before rename, requires MLSD,
+  and supports explicit/implicit TLS without downgrading the selected mode.
+  TGDB v1 encrypted uploads and offline `backup-decrypt`/`backup-restore`
+  commands use bounded buffers and authenticate before publishing output.
+  Google Drive and Dropbox are not available in 3.0. See [backup](../docs/BACKUP.md)
+  and [backup internals](../docs/GO-BACKUP.md).
+
+## Data safety
+
+SQLite uses WAL, `synchronous=NORMAL`, `busy_timeout=5000` and foreign keys.
+Schema creation is embedded and idempotent. Application ingestion looks up
+Telegram identities in the existing catalog before network I/O, retaining a
+separate message reference for each forward. Verified hashes include OS file
+identity/change metadata; active coordination is bounded by the worker limit.
+Transfers write a sibling `.part` file, sync it, then publish through directory
+handles with an exclusive rename. A durable journal recovers completed files
+when registration fails, and message generations prevent stale recovery from
+reverting edits. Cancelled transfers remove their partial files.
+
+Backups use SQLite `VACUUM INTO` and publish a timestamped file only after the
+snapshot is complete; each result includes byte count and SHA-256.
+
+## Telegram engine boundary
+
+`internal/telegram` extracts photo/document metadata directly from MTProto
+messages and provides an account-bound gotd media transport. `App.IngestTelegram`
+connects that metadata to the durable library, existing gallery files and
+WebSocket events. Integration tests use a fixture byte transport. The adapter
+does not dial during construction; network activity starts from `Run`.
+
+Monitor start/stop/restart now owns native gotd account connections and a durable
+SQLite work queue. Existing encrypted sessions are imported into a separate
+native directory; duplicate authentication keys and simultaneous servers using
+the same data directory are refused. Workers use their source account, refresh
+expired references, recheck filters and publish through the ingestion library.
+The queue snapshot reports actual byte progress and persists recent outcomes.
+SIGINT/SIGTERM stops HTTP acceptance, joins workers and closes browser sockets.
+
+Telegram cursors are stored per account/user/channel. Difference payloads are
+durably accepted before gotd can advance a cursor; persistence failures latch
+account shutdown. Oversized update gaps preserve a history-recovery marker and
+prevent restart until repaired. Channel-gap repair, account login, account
+pinning, proxies and durable queue controls are implemented. Tests use injected
+accounts and actual gotd update processing with fake RPCs; the
+[migration status](../docs/GO-MIGRATION-STATUS.md) records the pre-release
+evidence.
+
+Transfer attempts have a deadline of two minutes plus one second per 16 KiB,
+capped at 24 hours, so internal RPC retries cannot occupy a worker forever.
+Shutdown/edit cancellation returns work to pending without spending a retry;
+a transfer deadline consumes one of the configured attempts. Queued Telegram
+payloads stay private: the dashboard receives a bounded field projection.
+Set `TGDL_SECURE_COOKIES=1` when serving behind HTTPS.
+Set `TGDL_BIND_HOST=127.0.0.1` to restrict the native listener to local clients
+when a same-host reverse proxy exposes the dashboard. This accepts a literal
+IPv4/IPv6 address; `PORT` sets the port separately. An empty value listens on
+all interfaces.
+For a specific non-loopback interface, configure the initial password while
+bound to loopback, then restart with the intended bind address. The setup command
+never sends the password to a remote address or a different loopback service.
+Native HTTP policy now honors `TRUST_PROXY`, live HTTPS/CSP/API-limit settings,
+and bounded gzip/deflate/Brotli response compression. Compose forwards these
+options. See [HTTP policy, verification and limits](../docs/GO-HTTP-SECURITY.md).
+
+References:
+
+- [gotd introduction](https://gotd.dev/docs/intro/)
+- [gotd first client](https://gotd.dev/docs/getting-started/first-client/)
+- [Telegram API](https://core.telegram.org/api)
+- [Telegram update sequence and differences](https://core.telegram.org/api/updates)
+- [Pinned gotd update manager](https://github.com/gotd/td/tree/v0.115.0/telegram/updates)
+- [Go net/http](https://pkg.go.dev/net/http)
+- [modernc SQLite](https://pkg.go.dev/modernc.org/sqlite)
+
+## Development checks
+
+From the repository root:
+
+```sh
+make test     # go test ./...
+make check    # gofmt, go vet, go test -race ./...
+make build    # core-service/tgdl-server
+```
+
+Historical HTTP/WebSocket contract snapshots of the 2.x release remain under
+`tests/contract/` as reference data. They are never copied into the
+production image, and the production process tree contains only `tgdl-server`
+(plus ffmpeg while it generates media).

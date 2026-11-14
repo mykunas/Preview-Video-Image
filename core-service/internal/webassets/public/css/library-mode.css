@@ -1,0 +1,19 @@
+/* Local library interface. Keep DOM controls for existing modules, hide their entry points. */
+a[href^="#/groups"], a[href^="#/backfill"], a[href^="#/queue"],
+a[href^="#/account"], a[href^="#/engine"], a[href^="#/stories"],
+[data-nav="groups"], [data-nav="queue"],
+#onboarding-banner, #engine-status-pill, #backfill-chat-btn, #paste-url-btn, #stories-btn,
+[data-overflow="backfill-chat"], [data-overflow="chat-details"], [data-overflow="paste-url"], [data-overflow="stories"],
+#settings-accounts, #settings-downloads, #settings-network, #settings-federation,
+#settings-card-engine, #settings-card-advanced-details,
+[data-chip="card-engine"], [data-chip="card-accounts"], [data-chip="card-tg-api"],
+[data-chip="card-download"], [data-chip="card-federation"], [data-chip="network"],
+#page-groups, #page-backfill, #page-queue, #chats-tabs,
+#selection-zip, #modal-download, a[download],
+a[href$="/recovery"], a[href$="/cluster"], #groups-list [data-action="settings"] {
+    display: none !important;
+}
+
+/* Updates are hidden in this locally managed library build. */
+#status-update-badge, #status-update-dismiss, #maint-update-btn, #maint-update-status,
+#page-maintenance-updates, [data-mt-page="maintenance-updates"], a[href$="/updates"] { display: none !important; }

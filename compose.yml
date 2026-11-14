@@ -1,0 +1,95 @@
+name: preview-video-image
+services:
+  preview-video-image:
+    image: preview-video-image:3.4.19-library10
+    container_name: Preview-Video-Image
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      nsfw-service:
+        condition: service_healthy
+      faces-service:
+        condition: service_healthy
+    ports:
+      - "${TGDL_PORT:-39100}:3000"
+    environment:
+      TZ: Asia/Shanghai
+      TRUST_PROXY: ""
+      TGDL_NSFW_SIDECAR_URL: http://nsfw-service:8012
+      TGDL_NSFW_API_TOKEN: ${TGDL_NSFW_API_TOKEN:?Set NSFW API token in .env}
+      TGDL_FACES_SIDECAR_URL: http://faces-service:8011
+      TGDL_FACES_SIDECAR_TOKEN: ${TGDL_FACES_API_TOKEN:?Set faces API token in .env}
+    volumes:
+      - ${NAS_DATA_DIR:-./data}:/app/data
+      - type: bind
+        source: ${NAS_MEDIA_DIR:?Set media path in .env}
+        target: /app/data/downloads/_local/我的媒体
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  nsfw-service:
+    image: ghcr.io/botnick/tgdl-nsfw@sha256:f511e0e0e084a2bbae16f552bf284032cccf853aa1b3f12a76f3907aa44dd205
+    container_name: Preview-Video-Image-NSFW
+    restart: unless-stopped
+    cpus: 2.0
+    mem_limit: 2g
+    environment:
+      TGDL_NSFW_API_TOKEN: ${TGDL_NSFW_API_TOKEN:?Set NSFW API token in .env}
+      TGDL_NSFW_ALLOW_ROOTS: /app/data/downloads
+      HF_HOME: /models
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    volumes:
+      - ${NAS_DATA_DIR:-./data}/downloads:/app/data/downloads:ro
+      - type: bind
+        source: ${NAS_MEDIA_DIR:?Set media path in .env}
+        target: /app/data/downloads/_local/我的媒体
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./nsfw-models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8012/health',timeout=4)); sys.exit(0 if d.get('ok') and d.get('ready') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+
+  faces-service:
+    image: ghcr.io/botnick/tgdl-faces@sha256:354966bc0dc0dc91b29d1a9fd508de66e9dd059e0b1def212135169b694e9c2e
+    container_name: Preview-Video-Image-Faces
+    restart: unless-stopped
+    cpus: 2.0
+    mem_limit: 2g
+    environment:
+      TGDL_FACES_HOST: 0.0.0.0
+      TGDL_FACES_API_TOKEN: ${TGDL_FACES_API_TOKEN:?Set faces API token in .env}
+      TGDL_FACES_ALLOW_ROOTS: /app/data/downloads
+      TGDL_FACES_PROVIDERS: cpu
+      TGDL_FACES_CPU_THREADS: "2"
+      TGDL_FACES_MAX_CONCURRENCY: "1"
+    volumes:
+      - ${NAS_DATA_DIR:-./data}/downloads:/app/data/downloads:ro
+      - type: bind
+        source: ${NAS_MEDIA_DIR:?Set media path in .env}
+        target: /app/data/downloads/_local/我的媒体
+        read_only: true
+        bind:
+          create_host_path: false
+      - faces-models:/root/.cache/tgdl-faces/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,sys,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:8011/health',timeout=4)); sys.exit(0 if d.get('ok') and d.get('ready') else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  faces-models:

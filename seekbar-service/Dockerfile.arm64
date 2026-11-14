@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1.6
+#
+# seekbar-service — ARM64 optimised variant for Synology DSM arm64 NAS
+# units, Raspberry Pi 4/5, NVIDIA Jetson, and similar SBCs.
+#
+# The base Dockerfile already supports linux/arm64 via BuildKit's
+# TARGETPLATFORM split. Use this file when you want an explicitly
+# arm64-targeted image with V4L2 M2M hardware acceleration support
+# enabled and a smaller ffmpeg footprint.
+#
+# Build:
+#   docker buildx build -f Dockerfile.arm64 --platform linux/arm64 \
+#       -t tgdl-seekbar-arm64:latest .
+#
+# Run (Raspberry Pi / Jetson with V4L2 M2M HW decode):
+#   docker run --rm -p 8089:8089 \
+#       --device /dev/video0:/dev/video0 \
+#       --device /dev/video1:/dev/video1 \
+#       -v /path/to/videos:/videos:ro \
+#       -v /path/to/sprites:/out \
+#       -e SEEKBAR_OUTPUT_DIR=/out \
+#       -e SEEKBAR_HWACCEL=v4l2m2m \
+#       tgdl-seekbar-arm64:latest
+
+# ---- Stage 1: build the binary (native or cross-compiled via BuildKit) ---
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS build
+ARG TARGETOS=linux
+ARG TARGETARCH=arm64
+
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+        go build -trimpath -ldflags '-s -w' -o /out/seekbar-server ./cmd/server && \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+        go build -trimpath -ldflags '-s -w' -o /out/seekbar-cli ./cmd/cli
+
+# ---- Stage 2: ARM64 runtime with V4L2 + VAAPI support --------------------
+#
+# Debian bookworm ffmpeg on arm64 ships with:
+#   - v4l2m2m  (Raspberry Pi 4/5, most SBCs)
+#   - VAAPI    (Rockchip RK3588, some Mali boards via mesa)
+# libwebp is included in the debian ffmpeg build so WebP sprite encoding
+# works without a sharp fallback.
+FROM --platform=linux/arm64 debian:bookworm-slim AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        tini \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Non-root user — matches the telegram-media-downloader convention.
+RUN useradd --system --create-home --uid 1000 --user-group seekbar
+
+COPY --from=build /out/seekbar-server /usr/local/bin/seekbar-server
+COPY --from=build /out/seekbar-cli    /usr/local/bin/seekbar-cli
+
+ENV SEEKBAR_VERSION=0.2.0 \
+    SEEKBAR_OUTPUT_DIR=/data/output \
+    SEEKBAR_TEMP_DIR=/data/tmp \
+    SEEKBAR_HTTP_LISTEN=:8089 \
+    SEEKBAR_HWACCEL=auto \
+    SEEKBAR_CONCURRENCY=2 \
+    SEEKBAR_LOG_LEVEL=info \
+    SEEKBAR_LOG_FORMAT=text
+
+RUN mkdir -p /data/output /data/tmp && chown -R seekbar:seekbar /data
+
+USER seekbar
+WORKDIR /home/seekbar
+EXPOSE 8089
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["/bin/sh","-c","wget -qO- --tries=1 --timeout=3 http://127.0.0.1:8089/health | grep -q '\"ok\":true'"]
+
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/seekbar-server"]

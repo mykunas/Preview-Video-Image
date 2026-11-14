@@ -1,0 +1,119 @@
+# Obsolete tool caches (keep accidental installs out of Git)
+/data/
+/nsfw-models/
+/faces-models/
+/build-tools/
+/deployment-backups/
+/backups/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.tar
+*.tar.gz
+*.zip
+*.pem
+*.key
+
+node_modules/
+.pnp/
+.pnp.js
+.yarn/install-state.gz
+
+# Lockfiles from unused package managers
+yarn.lock
+pnpm-lock.yaml
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Local launcher scripts
+*.bat
+*.cmd
+sidecar-start.*
+sidecar-tunnel.*
+
+# Runtime data (everything under data/ is gitignored except a few examples)
+data/
+
+# Logs / crash reports
+*.log
+logs/
+protection_log.txt
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test / coverage output
+coverage/
+.nyc_output/
+.vitest-cache/
+*.lcov
+
+# Build output (currently unused; reserved)
+dist/
+build/
+out/
+.next/
+.cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*~
+.history/
+
+# Husky internal
+.husky/_/
+
+# Local-only assistant / agent state
+brain/
+.gemini/
+.agent/
+.claude/
+SKILL.md
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# Python sidecar (faces-service/) build artefacts + caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+.venv/
+faces-service/build/
+faces-service/dist/
+faces-service/.coverage
+faces-service/htmlcov/
+
+# Go sidecar (seekbar-service/) build artefacts
+seekbar-service/bin/
+seekbar-service/dist/
+seekbar-service/seekbar-server
+seekbar-service/seekbar-server.exe
+seekbar-service/seekbar-cli
+
+# Go core (core-service/) build artefacts
+core-service/bin/
+core-service/dist/
+core-service/tgdl-server
+core-service/tgdl-server.exe
+faces-service/tgdl-faces-win-x64.spec
